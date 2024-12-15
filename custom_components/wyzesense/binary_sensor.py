@@ -14,15 +14,17 @@ import os.path
 from os import path
 from retry import retry
 import subprocess
+import aiofiles
 
-from homeassistant.const import CONF_FILENAME, CONF_DEVICE, \
-    EVENT_HOMEASSISTANT_STOP, STATE_ON, STATE_OFF, ATTR_BATTERY_LEVEL, \
-    ATTR_STATE, ATTR_DEVICE_CLASS, DEVICE_CLASS_TIMESTAMP
-
-try:
-    from homeassistant.components.binary_sensor import PLATFORM_SCHEMA, BinarySensorEntity, DEVICE_CLASS_MOTION, DEVICE_CLASS_DOOR
-except ImportError:
-    from homeassistant.components.binary_sensor import BinarySensorDevice as BinarySensorEntity, PLATFORM_SCHEMA, DEVICE_CLASS_MOTION, DEVICE_CLASS_DOOR
+from homeassistant.const import (
+    CONF_FILENAME, CONF_DEVICE, EVENT_HOMEASSISTANT_STOP, STATE_ON, STATE_OFF,
+    ATTR_BATTERY_LEVEL, ATTR_STATE, ATTR_DEVICE_CLASS
+)
+from homeassistant.components.binary_sensor import (
+    PLATFORM_SCHEMA, BinarySensorEntity, BinarySensorDeviceClass
+)
+from homeassistant.components import persistent_notification
+from homeassistant.components.sensor import SensorDeviceClass
 
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -53,15 +55,18 @@ SERVICE_REMOVE_SCHEMA = vol.Schema({
 
 _LOGGER = logging.getLogger(__name__)
 
-def getStorage(hass):
-    if not path.exists(hass.config.path(STORAGE)):
+async def getStorage(hass):
+    storage_path = hass.config.path(STORAGE)
+    if not os.path.exists(storage_path):
         return []
-    with open(hass.config.path(STORAGE),'r') as f:
-        return json.load(f)
+    async with aiofiles.open(storage_path, 'r') as f:
+        content = await f.read()
+        return json.loads(content)
 
-def setStorage(hass,data):
-    with open(hass.config.path(STORAGE),'w') as f:
-        json.dump(data, f)
+async def setStorage(hass, data):
+    storage_path = hass.config.path(STORAGE)
+    async with aiofiles.open(storage_path, 'w') as f:
+        await f.write(json.dumps(data))
 
 def findDongle():
     df = subprocess.check_output(["ls", "-la", "/sys/class/hidraw"]).decode('utf-8').lower()
@@ -71,8 +76,8 @@ def findDongle():
                 if ("hidraw" in w):
                     return "/dev/%s" % w
 
-def setup_platform(hass, config, add_entites, discovery_info=None):
-    if config[CONF_DEVICE].lower() == 'auto': 
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+    if config[CONF_DEVICE].lower() == 'auto':
         config[CONF_DEVICE] = findDongle()
     _LOGGER.debug("WYZESENSE v0.0.9")
     _LOGGER.debug("Attempting to open connection to hub at " + config[CONF_DEVICE])
@@ -87,8 +92,8 @@ def setup_platform(hass, config, add_entites, discovery_info=None):
                 ATTR_AVAILABLE: True,
                 ATTR_MAC: event.MAC,
                 ATTR_STATE: 1 if sensor_state == "open" or sensor_state == "active" else 0,
-                ATTR_DEVICE_CLASS: DEVICE_CLASS_MOTION if sensor_type == "motion" else DEVICE_CLASS_DOOR ,
-                DEVICE_CLASS_TIMESTAMP: event.Timestamp.isoformat(),
+                ATTR_DEVICE_CLASS: BinarySensorDeviceClass.MOTION if sensor_type == "motion" else BinarySensorDeviceClass.DOOR,
+                SensorDeviceClass.TIMESTAMP: event.Timestamp.isoformat(),
                 ATTR_RSSI: sensor_signal * -1,
                 ATTR_BATTERY_LEVEL: sensor_battery
             }
@@ -98,28 +103,26 @@ def setup_platform(hass, config, add_entites, discovery_info=None):
             if not event.MAC in entities:
                 new_entity = WyzeSensor(data)
                 entities[event.MAC] = new_entity
-                add_entites([new_entity])
-        
-                storage = getStorage(hass)
-                if event.MAC not in storage:
-                    storage.append(event.MAC)
-                setStorage(hass, storage)
+                hass.add_job(async_add_entities, [new_entity])
+                hass.add_job(update_storage, hass, event.MAC)
                 
             else:
                 entities[event.MAC]._data = data
-                # From https://github.com/kevinvincent/ha-wyzesense/issues/189
-                try:
-                    entities[event.MAC].schedule_update_ha_state()
-                except (AttributeError, AssertionError):
-                    _LOGGER.debug("wyze Sensor not yet ready for update")
+                hass.add_job(entities[event.MAC].async_write_ha_state)
+
+    async def update_storage(hass, mac):
+        storage = await getStorage(hass)
+        if mac not in storage:
+            storage.append(mac)
+            await setStorage(hass, storage)
 
     @retry(TimeoutError, tries=10, delay=1, logger=_LOGGER)
     def beginConn():
         return Open(config[CONF_DEVICE], on_event)
 
-    ws = beginConn()
+    ws = await hass.async_add_executor_job(beginConn)
 
-    storage = getStorage(hass)
+    storage = await getStorage(hass)
 
     _LOGGER.debug("%d Sensors Loaded from storage" % len(storage))
 
@@ -143,49 +146,49 @@ def setup_platform(hass, config, add_entites, discovery_info=None):
         if not mac in entities:
             new_entity = WyzeSensor(data, should_restore = True, override_restore_state = initial_state)
             entities[mac] = new_entity
-            add_entites([new_entity])
+            async_add_entities([new_entity])
 
     # Configure Destructor
-    def on_shutdown(event):
-        _LOGGER.debug("Closing connection to hub")
-        ws.Stop()
+    async def async_on_shutdown(event):
+        """Close connection to hub."""
+        await hass.async_add_executor_job(ws.Stop)
 
-    hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, on_shutdown)
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_on_shutdown)
 
     # Configure Service
-    def on_scan(call):
-        result = ws.Scan()
+    async def async_on_scan(call):
+        result = await hass.async_add_executor_job(ws.Scan)
         if result:
-            notification = "Sensor found and added as: binary_sensor.wyzesense_%s (unless you have customized the entity ID prior).<br/>To add more sensors, call wyzesense.scan again.<br/><br/>More Info: type=%d, version=%d" % result
-            hass.components.persistent_notification.create(notification, DOMAIN)
+            notification = f"Sensor found and added as: binary_sensor.wyzesense_{result[0]} (unless you have customized the entity ID prior). To add more sensors, call wyzesense.scan again. More Info: type={result[1]}, version={result[2]}"
+            persistent_notification.create(hass, notification, DOMAIN)
             _LOGGER.debug(notification)
         else:
             notification = "Scan completed with no sensor found."
-            hass.components.persistent_notification.create(notification, DOMAIN)
+            persistent_notification.create(hass, notification, DOMAIN)
             _LOGGER.debug(notification)
 
-    def on_remove(call):
+    async def async_on_remove(call):
         mac = call.data.get(ATTR_MAC).upper()
         if entities.get(mac):
-            ws.Delete(mac)
+            await hass.async_add_executor_job(ws.Delete, mac)
             toDelete = entities[mac]
-            hass.add_job(toDelete.async_remove)
+            await toDelete.async_remove()
             del entities[mac]
 
-            storage = getStorage(hass)
+            storage = await getStorage(hass)
             storage.remove(mac)
-            setStorage(hass, storage)
+            await setStorage(hass, storage)
 
-            notification = "Successfully removed sensor: %s" % mac
-            hass.components.persistent_notification.create(notification, DOMAIN)
+            notification = f"Successfully removed sensor: {mac}"
+            persistent_notification.create(hass, notification, DOMAIN)
             _LOGGER.debug(notification)
         else:
-            notification = "No sensor with mac %s found to remove." % mac
-            hass.components.persistent_notification.create(notification, DOMAIN)
+            notification = f"No sensor with mac {mac} found to remove."
+            persistent_notification.create(hass, notification, DOMAIN)
             _LOGGER.debug(notification)
 
-    hass.services.register(DOMAIN, SERVICE_SCAN, on_scan, SERVICE_SCAN_SCHEMA)
-    hass.services.register(DOMAIN, SERVICE_REMOVE, on_remove, SERVICE_REMOVE_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_SCAN, async_on_scan, SERVICE_SCAN_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_REMOVE, async_on_remove, SERVICE_REMOVE_SCHEMA)
 
 
 class WyzeSensor(BinarySensorEntity, RestoreEntity):
